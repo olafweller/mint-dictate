@@ -1,6 +1,6 @@
 # Mint Dictate
 
-Mint Dictate is a Linux Mint X11 tray app that turns a configurable global hotkey into desktop dictation. It records your voice, sends the audio to OpenAI speech-to-text, copies the transcript to the clipboard, and pastes it into the active text field with `Ctrl+V`.
+Mint Dictate is a Linux Mint X11 tray app that turns a configurable global hotkey into desktop dictation. It records your voice, sends the audio to OpenAI speech-to-text, copies the transcript to the clipboard, and automatically pastes it into the active text field.
 
 It is built for practical dictation on Cinnamon/X11. Browser address bars, VS Code, chat apps, and standard text editors are the main target.
 
@@ -134,6 +134,10 @@ Advanced options such as `paste_delay_seconds`, `recording_path`, and `pause_med
 - Clipboard does not work:
   Make sure `xclip` is installed
 
+## Development Notes
+
+Mint Dictate was built by Olaf Weller with help from OpenAI Codex during design, implementation, and iteration.
+
 ## Publishing Notes
 
 This repo already includes:
@@ -142,8 +146,3 @@ This repo already includes:
 - `LICENSE`
 - `config.example.json`
 - `mint-dictate.service`
-
-Before publishing, the best remaining polish is still:
-
-- add a screenshot of the tray menu and settings window
-- optionally add a short GIF of the dictation flow

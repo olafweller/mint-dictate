@@ -16,7 +16,7 @@ from pathlib import Path
 
 APP_NAME = "Mint Dictate"
 APP_ID = "mint-dictate"
-APP_AUTHOR = "Olaf"
+APP_AUTHOR = "Olaf Weller"
 APP_WEBSITE = "https://x.com/WellerOlaf"
 APP_DESCRIPTION = "Dictate text anywhere in Linux Mint using your OpenAI API key."
 APP_DIR = Path(__file__).resolve().parent
