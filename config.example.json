@@ -1,0 +1,11 @@
+{
+  "openai_api_key": "sk-your-key-here",
+  "transcription_model": "gpt-4o-mini-transcribe",
+  "language": null,
+  "sample_rate": 16000,
+  "channels": 1,
+  "max_recording_seconds": 300,
+  "hotkey": "<ctrl>+<alt>+m",
+  "paste_delay_seconds": 0.15,
+  "recording_path": "/tmp/mint-dictate.wav"
+}
