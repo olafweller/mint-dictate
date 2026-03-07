@@ -1,6 +1,6 @@
 # Mint Dictate
 
-Mint Dictate is a Linux Mint X11 tray app that turns a configurable global hotkey into desktop dictation. It records your voice, sends the audio to OpenAI speech-to-text, copies the transcript to the clipboard, and automatically pastes it into the active text field.
+Mint Dictate is a Linux Mint X11 tray app that turns a configurable global hotkey into desktop dictation. It records your voice, transcribes it with either OpenAI speech-to-text or a local `faster-whisper` model, copies the transcript to the clipboard, and automatically pastes it into the active text field.
 
 It is built for practical dictation on Cinnamon/X11. Browser address bars, VS Code, chat apps, and standard text editors are the main target.
 
@@ -9,7 +9,7 @@ It is built for practical dictation on Cinnamon/X11. Browser address bars, VS Co
 - Configurable global hotkey toggles start and stop
 - Native Linux tray integration via GTK AppIndicator
 - Tray menu with: start/stop, status, transcript preview, settings, about, restart
-- GTK settings window for API key, model, language, hotkey, and max recording time
+- GTK settings window for backend, API key, model, language, hotkey, and max recording time
 - Automatic language detection, specific language selection, or custom language code
 - Clipboard-first workflow, then automatic `Ctrl+V` paste
 - Optional media auto-pause during recording when `playerctl` is installed
@@ -20,7 +20,8 @@ It is built for practical dictation on Cinnamon/X11. Browser address bars, VS Co
 - X11 only. Wayland is not a supported target.
 - Paste is simulated with `xdotool`, so the target text field must still have focus when transcription finishes.
 - Media auto-pause only works for players that expose MPRIS controls.
-- This app uses your own OpenAI API key.
+- OpenAI mode uses your own OpenAI API key.
+- Local mode requires `faster-whisper` and a downloaded Whisper model.
 
 ## Requirements
 
@@ -48,15 +49,18 @@ mkdir -p ~/.config/mint-dictate
 cp config.example.json ~/.config/mint-dictate/config.json
 ```
 
-Then add your OpenAI API key to `~/.config/mint-dictate/config.json`.
+Then add your OpenAI API key to `~/.config/mint-dictate/config.json`, or switch the backend to local transcription.
 
 If that file does not exist, the app can still fall back to `config.json` in the project directory, but the user config path is the intended location.
 
 Defaults:
 
+- `transcription_backend`: `openai`
 - `transcription_model`: `gpt-4o-mini-transcribe`
 - `language`: `null` for automatic language detection
 - `hotkey`: configurable in Settings
+- `local_model_device`: `cpu`
+- `local_model_compute_type`: `int8`
 
 Logs are written to `~/.cache/mint-dictate.log`.
 
@@ -110,6 +114,7 @@ The tray menu is designed for normal users, not just debugging:
 
 The GTK settings window lets users change the core behavior without editing JSON:
 
+- Transcription backend
 - OpenAI API key
 - Transcription model
 - Language mode:
@@ -119,7 +124,7 @@ The GTK settings window lets users change the core behavior without editing JSON
 - Hotkey capture button
 - Maximum recording duration
 
-Advanced options such as `paste_delay_seconds`, `recording_path`, and `pause_media_during_recording` remain available in the config file.
+Advanced options such as `paste_delay_seconds`, `recording_path`, `pause_media_during_recording`, `local_model_device`, and `local_model_compute_type` remain available in the config file.
 
 ## Troubleshooting
 

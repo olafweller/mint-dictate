@@ -1,4 +1,5 @@
 {
+  "transcription_backend": "openai",
   "openai_api_key": "sk-your-key-here",
   "transcription_model": "gpt-4o-mini-transcribe",
   "language": null,
@@ -7,5 +8,7 @@
   "max_recording_seconds": 300,
   "hotkey": "<ctrl>+<alt>+m",
   "paste_delay_seconds": 0.15,
-  "recording_path": "/tmp/mint-dictate.wav"
+  "recording_path": "/tmp/mint-dictate.wav",
+  "local_model_device": "cpu",
+  "local_model_compute_type": "int8"
 }
