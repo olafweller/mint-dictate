@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import gc
 import json
 import logging
 import os
@@ -79,6 +80,7 @@ DEFAULT_CONFIG = {
     "local_model_compute_type": "int8",
     "local_transcription_stats": {},
 }
+LOCAL_MODEL_IDLE_TIMEOUT_SECONDS = 120
 LOCAL_TRANSCRIPTION_MODELS = [
     "large-v3-turbo",
     "medium",
@@ -185,6 +187,36 @@ def launch_path(path: Path) -> None:
         )
     except FileNotFoundError:
         notify(APP_NAME, f"Kon {path} niet openen: xdg-open ontbreekt.")
+
+
+def run_local_transcription_worker_server(
+    model_name: str,
+    device: str,
+    compute_type: str,
+) -> int:
+    if WhisperModel is None:
+        print(json.dumps({"error": "faster-whisper is niet geïnstalleerd."}), flush=True)
+        return 1
+
+    try:
+        model = WhisperModel(model_name, device=device, compute_type=compute_type)
+        print(json.dumps({"ready": True}), flush=True)
+        for line in sys.stdin:
+            request = json.loads(line)
+            audio_path = str(request["audio_path"])
+            language = request.get("language") or None
+            segments, _info = model.transcribe(
+                audio_path,
+                beam_size=5,
+                language=language,
+            )
+            text = " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
+            print(json.dumps({"text": text}), flush=True)
+        return 0
+    except Exception as exc:
+        logging.exception("Local transcription worker failed")
+        print(json.dumps({"error": str(exc)}), flush=True)
+        return 1
 
 
 def make_icon_image(color: str, size: int = 64) -> Image.Image:
@@ -929,8 +961,10 @@ class MintDictateApp:
     def __init__(self) -> None:
         self.config = load_config()
         self.client = None
-        self.local_model = None
-        self.model_lock = threading.Lock()
+        self.local_worker_process = None
+        self.local_worker_profile = None
+        self.local_worker_lock = threading.Lock()
+        self.local_worker_unload_timer = None
         self._refresh_clients()
         self.state_lock = threading.Lock()
         self.audio_lock = threading.Lock()
@@ -968,6 +1002,8 @@ class MintDictateApp:
             self.hotkey_listener.stop()
         self._cancel_timer()
         self._cancel_local_progress_timer()
+        self._cancel_local_worker_unload_timer()
+        self._stop_local_worker()
         if self.is_recording:
             self._stop_recording_internal()
         self.ui.stop()
@@ -992,7 +1028,8 @@ class MintDictateApp:
 
     def _refresh_clients(self) -> None:
         self.client = None
-        self.local_model = None
+        self._cancel_local_worker_unload_timer()
+        self._stop_local_worker()
 
     def apply_config(self, new_config: dict) -> None:
         self.config = DEFAULT_CONFIG.copy() | self.config | new_config
@@ -1123,6 +1160,123 @@ class MintDictateApp:
             self.local_progress_timer.cancel()
             self.local_progress_timer = None
 
+    def _local_worker_config(self) -> tuple[str, str, str]:
+        return (
+            self.config["transcription_model"],
+            self.config.get("local_model_device", DEFAULT_CONFIG["local_model_device"]),
+            self.config.get("local_model_compute_type", DEFAULT_CONFIG["local_model_compute_type"]),
+        )
+
+    def _cancel_local_worker_unload_timer(self) -> None:
+        if self.local_worker_unload_timer:
+            self.local_worker_unload_timer.cancel()
+            self.local_worker_unload_timer = None
+
+    def _stop_local_worker(self) -> None:
+        with self.local_worker_lock:
+            process = self.local_worker_process
+            self.local_worker_process = None
+            self.local_worker_profile = None
+        if process is None:
+            return
+        try:
+            if process.stdin:
+                process.stdin.close()
+        except Exception:
+            pass
+        try:
+            process.terminate()
+            process.wait(timeout=3)
+        except Exception:
+            try:
+                process.kill()
+                process.wait(timeout=1)
+            except Exception:
+                pass
+        gc.collect()
+        logging.info("Stopped local Whisper worker")
+
+    def _schedule_local_worker_unload(self) -> None:
+        with self.local_worker_lock:
+            if self.local_worker_process is None or self.local_worker_process.poll() is not None:
+                return
+        self._cancel_local_worker_unload_timer()
+        self.local_worker_unload_timer = threading.Timer(
+            LOCAL_MODEL_IDLE_TIMEOUT_SECONDS,
+            self._stop_local_worker_from_timer,
+        )
+        self.local_worker_unload_timer.daemon = True
+        self.local_worker_unload_timer.start()
+        logging.info(
+            "Scheduled local Whisper worker stop in %s seconds",
+            LOCAL_MODEL_IDLE_TIMEOUT_SECONDS,
+        )
+
+    def _stop_local_worker_from_timer(self) -> None:
+        self.local_worker_unload_timer = None
+        self._stop_local_worker()
+
+    def _ensure_local_worker(self):
+        profile = self._local_worker_config()
+        self._cancel_local_worker_unload_timer()
+        with self.local_worker_lock:
+            process = self.local_worker_process
+            if (
+                process is not None
+                and process.poll() is None
+                and self.local_worker_profile == profile
+            ):
+                return process
+
+            if process is not None:
+                try:
+                    if process.stdin:
+                        process.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    process.terminate()
+                    process.wait(timeout=3)
+                except Exception:
+                    try:
+                        process.kill()
+                        process.wait(timeout=1)
+                    except Exception:
+                        pass
+
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "--local-transcribe-server",
+                    profile[0],
+                    profile[1],
+                    profile[2],
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            ready_line = process.stdout.readline() if process.stdout else ""
+            try:
+                ready_payload = json.loads(ready_line.strip()) if ready_line.strip() else {}
+            except json.JSONDecodeError:
+                ready_payload = {}
+            if process.poll() is not None or not ready_payload.get("ready"):
+                stderr_output = ""
+                if process.stderr:
+                    stderr_output = process.stderr.read().strip()
+                self.local_worker_process = None
+                self.local_worker_profile = None
+                raise RuntimeError(stderr_output or "Lokale transcriptieworker startte niet correct.")
+
+            self.local_worker_process = process
+            self.local_worker_profile = profile
+            logging.info("Started local Whisper worker for %s/%s/%s", *profile)
+            return process
+
     def _schedule_local_progress_tick(self) -> None:
         self._cancel_local_progress_timer()
         if not self.should_show_local_progress():
@@ -1242,6 +1396,7 @@ class MintDictateApp:
         with self.audio_lock:
             self.audio_chunks = []
         self.local_progress = None
+        self._cancel_local_worker_unload_timer()
 
         try:
             self.stream = sd.InputStream(
@@ -1325,6 +1480,7 @@ class MintDictateApp:
                 self.transcription_started_at = 0.0
                 self._set_state("idle")
                 self.busy = False
+                self._schedule_local_worker_unload()
                 notify(APP_NAME, "Geen tekst herkend.")
                 return
 
@@ -1343,6 +1499,7 @@ class MintDictateApp:
             self.transcription_started_at = 0.0
             self._set_state("idle")
             self.busy = False
+            self._schedule_local_worker_unload()
             preview = text[:80] + ("..." if len(text) > 80 else "")
             notify(APP_NAME, f"Transcript geplakt: {preview}")
         except Exception as exc:
@@ -1354,6 +1511,7 @@ class MintDictateApp:
             self.transcription_started_at = 0.0
             self._set_state("error")
             self.busy = False
+            self._schedule_local_worker_unload()
             self.last_error = str(exc)
             notify(APP_NAME, f"Transcriptie mislukt: {exc}")
 
@@ -1375,37 +1533,40 @@ class MintDictateApp:
     def _transcribe(self, audio_path: str) -> str:
         return self._transcribe_local(audio_path)
 
-    def _get_local_model(self):
-        if WhisperModel is None:
-            raise RuntimeError("faster-whisper is niet geïnstalleerd.")
-        with self.model_lock:
-            if self.local_model is None:
-                self.local_model = WhisperModel(
-                    self.config["transcription_model"],
-                    device=self.config.get("local_model_device", DEFAULT_CONFIG["local_model_device"]),
-                    compute_type=self.config.get("local_model_compute_type", DEFAULT_CONFIG["local_model_compute_type"]),
-                )
-            return self.local_model
-
     def _transcribe_local(self, audio_path: str) -> str:
-        model = self._get_local_model()
         audio_info = sf.info(audio_path)
         duration = max(float(audio_info.duration or 0.0), 0.0)
         self.local_progress_audio_duration = duration
-        segments, _info = model.transcribe(
-            audio_path,
-            beam_size=5,
-            language=self.config.get("language") or None,
-        )
-        collected_segments = []
-        for segment in segments:
-            text = segment.text.strip()
-            if text:
-                collected_segments.append(text)
-            if duration > 0:
-                self._set_local_progress(max(self.local_progress or 0.0, min(segment.end / duration, 0.99)))
+        process = self._ensure_local_worker()
+        request = {
+            "audio_path": audio_path,
+            "language": self.config.get("language") or "",
+        }
+        if not process.stdin or not process.stdout:
+            raise RuntimeError("Lokale transcriptieworker heeft geen geldige IO-kanalen.")
+        try:
+            process.stdin.write(json.dumps(request) + "\n")
+            process.stdin.flush()
+            response_line = process.stdout.readline()
+        except Exception as exc:
+            self._stop_local_worker()
+            raise RuntimeError(f"Communicatie met lokale transcriptieworker mislukt: {exc}") from exc
+
+        if process.poll() is not None and not response_line:
+            stderr_output = process.stderr.read().strip() if process.stderr else ""
+            self._stop_local_worker()
+            raise RuntimeError(stderr_output or "Lokale transcriptieworker stopte onverwacht.")
+
+        try:
+            payload = json.loads(response_line.strip()) if response_line.strip() else {}
+        except json.JSONDecodeError as exc:
+            self._stop_local_worker()
+            raise RuntimeError("Lokale transcriptieworker gaf ongeldige JSON terug.") from exc
+
+        if payload.get("error"):
+            raise RuntimeError(str(payload["error"]))
         self._set_local_progress(1.0)
-        return " ".join(collected_segments).strip()
+        return str(payload.get("text") or "").strip()
 
     def _set_state(self, state: str) -> None:
         self.state = state
@@ -1432,6 +1593,15 @@ class MintDictateApp:
 
 
 def main() -> None:
+    if len(sys.argv) >= 5 and sys.argv[1] == "--local-transcribe-server":
+        raise SystemExit(
+            run_local_transcription_worker_server(
+                model_name=sys.argv[2],
+                device=sys.argv[3],
+                compute_type=sys.argv[4],
+            )
+        )
+
     app = MintDictateApp()
 
     def handle_signal(signum, frame) -> None:
