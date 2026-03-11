@@ -14,11 +14,11 @@ import time
 import traceback
 from pathlib import Path
 
-APP_NAME = "Mint Dictate"
-APP_ID = "mint-dictate"
+APP_NAME = "Mint Dictate Local"
+APP_ID = "mint-dictate-local"
 APP_AUTHOR = "Olaf Weller"
 APP_WEBSITE = "https://x.com/WellerOlaf"
-APP_DESCRIPTION = "Dictate text anywhere in Linux Mint with OpenAI or a local Whisper model."
+APP_DESCRIPTION = "Dictate text anywhere in Linux Mint with a local Whisper model."
 APP_DIR = Path(__file__).resolve().parent
 for site_packages in sorted((APP_DIR / ".venv" / "lib").glob("python*/site-packages")):
     site_path = str(site_packages)
@@ -29,7 +29,6 @@ import numpy as np
 import pyperclip
 import sounddevice as sd
 import soundfile as sf
-from openai import OpenAI
 from PIL import Image, ImageDraw
 from pynput import keyboard
 
@@ -61,14 +60,13 @@ except Exception:
     WhisperModel = None
 
 PROJECT_CONFIG_PATH = Path.cwd() / "config.json"
-USER_CONFIG_PATH = Path.home() / ".config" / "mint-dictate" / "config.json"
-LEGACY_USER_CONFIG_PATH = Path.home() / ".config" / "linux-mint-speech-to-text" / "config.json"
-LOG_PATH = Path.home() / ".cache" / "mint-dictate.log"
-ICON_CACHE_DIR = Path.home() / ".cache" / "mint-dictate-icons"
+USER_CONFIG_PATH = Path.home() / ".config" / "mint-dictate-local" / "config.json"
+LEGACY_USER_CONFIG_PATH = Path.home() / ".config" / "mint-dictate" / "config.json"
+LOG_PATH = Path.home() / ".cache" / "mint-dictate-local.log"
+ICON_CACHE_DIR = Path.home() / ".cache" / "mint-dictate-local-icons"
 DEFAULT_CONFIG = {
-    "transcription_backend": "openai",
-    "openai_api_key": "",
-    "transcription_model": "gpt-4o-mini-transcribe",
+    "transcription_backend": "local",
+    "transcription_model": "small",
     "language": None,
     "sample_rate": 16000,
     "channels": 1,
@@ -81,30 +79,16 @@ DEFAULT_CONFIG = {
     "local_model_compute_type": "int8",
     "local_transcription_stats": {},
 }
-OPENAI_TRANSCRIPTION_MODELS = [
-    "gpt-4o-mini-transcribe",
-    "gpt-4o-transcribe",
-    "gpt-4o-transcribe-diarize",
-    "whisper-1",
-]
 LOCAL_TRANSCRIPTION_MODELS = [
     "large-v3-turbo",
     "medium",
     "small",
 ]
 MODEL_LABELS = {
-    "gpt-4o-mini-transcribe": "GPT-4o mini",
-    "gpt-4o-transcribe": "GPT-4o Transcribe",
-    "gpt-4o-transcribe-diarize": "GPT-4o Transcribe diarize",
-    "whisper-1": "Whisper",
     "large-v3-turbo": "Large v3 Turbo",
     "medium": "Medium",
     "small": "Small",
 }
-TRANSCRIPTION_BACKENDS = [
-    ("openai", "OpenAI API"),
-    ("local", "Local faster-whisper"),
-]
 LANGUAGE_OPTIONS = [
     ("ar", "Arabic"),
     ("zh", "Chinese"),
@@ -224,16 +208,7 @@ def build_icon_paths() -> dict[str, str]:
 
 
 def models_for_backend(backend: str) -> list[str]:
-    if backend == "local":
-        return list(LOCAL_TRANSCRIPTION_MODELS)
-    return list(OPENAI_TRANSCRIPTION_MODELS)
-
-
-def backend_label(backend: str) -> str:
-    for value, label in TRANSCRIPTION_BACKENDS:
-        if value == backend:
-            return label
-    return backend
+    return list(LOCAL_TRANSCRIPTION_MODELS)
 
 
 def model_label(model_name: str) -> str:
@@ -263,8 +238,10 @@ def load_config() -> dict:
         loaded = json.loads(content)
         if "transcription_model" not in loaded and "whisper_model" in loaded:
             loaded["transcription_model"] = loaded["whisper_model"]
-        if loaded.get("transcription_model") in LOCAL_TRANSCRIPTION_MODELS and "transcription_backend" not in loaded:
-            loaded["transcription_backend"] = "local"
+        loaded["transcription_backend"] = "local"
+        if loaded.get("transcription_model") not in LOCAL_TRANSCRIPTION_MODELS:
+            loaded["transcription_model"] = DEFAULT_CONFIG["transcription_model"]
+        loaded.pop("openai_api_key", None)
         config.update(loaded)
         logging.info("Loaded config from %s", path)
     return config
@@ -309,15 +286,6 @@ class SettingsWindow:
         grid = Gtk.Grid(column_spacing=12, row_spacing=10)
         outer.pack_start(grid, True, True, 0)
 
-        self.api_key_entry = Gtk.Entry()
-        self.api_key_entry.set_visibility(False)
-        self.api_key_entry.set_invisible_char("*")
-
-        self.backend_combo = Gtk.ComboBoxText()
-        for backend, label in TRANSCRIPTION_BACKENDS:
-            self.backend_combo.append(backend, label)
-        self.backend_combo.connect("changed", self._on_backend_changed)
-
         self.model_combo = Gtk.ComboBoxText()
 
         self.language_mode_combo = Gtk.ComboBoxText()
@@ -353,8 +321,6 @@ class SettingsWindow:
         self.max_recording_entry.set_increments(1, 10)
 
         rows = [
-            ("Transcription Backend", self.backend_combo),
-            ("OpenAI API Key", self.api_key_entry),
             ("Transcription Model", self.model_combo),
             ("Language", self.language_box),
             ("Hotkey", self.hotkey_box),
@@ -392,20 +358,16 @@ class SettingsWindow:
         self.load_from_app_config()
         self.message_label.set_text("")
         self.window.show_all()
-        self._update_backend_visibility()
         self._update_language_visibility()
         self.window.present()
 
     def load_from_app_config(self) -> None:
         config = self.app.config
-        self.backend_combo.set_active_id(config.get("transcription_backend", DEFAULT_CONFIG["transcription_backend"]))
-        self.api_key_entry.set_text(config.get("openai_api_key", ""))
         self._set_model(config.get("transcription_model", DEFAULT_CONFIG["transcription_model"]))
         self._set_language_state(config.get("language"))
         self.captured_hotkey = config.get("hotkey", DEFAULT_CONFIG["hotkey"])
         self.hotkey_value_label.set_text(self.captured_hotkey)
         self.max_recording_entry.set_value(float(config.get("max_recording_seconds", DEFAULT_CONFIG["max_recording_seconds"])))
-        self._update_backend_visibility()
 
     def _set_model(self, model_name: str) -> None:
         items = self._model_choices()
@@ -422,17 +384,13 @@ class SettingsWindow:
         return model or DEFAULT_CONFIG["transcription_model"]
 
     def _current_backend(self) -> str:
-        return self.backend_combo.get_active_id() or DEFAULT_CONFIG["transcription_backend"]
+        return "local"
 
     def _model_choices(self) -> list[str]:
-        if self._current_backend() == "local":
-            return list(LOCAL_TRANSCRIPTION_MODELS)
-        return list(OPENAI_TRANSCRIPTION_MODELS)
+        return list(LOCAL_TRANSCRIPTION_MODELS)
 
     def _default_model_for_backend(self) -> str:
-        if self._current_backend() == "local":
-            return LOCAL_TRANSCRIPTION_MODELS[0]
-        return OPENAI_TRANSCRIPTION_MODELS[0]
+        return LOCAL_TRANSCRIPTION_MODELS[0]
 
     def _set_language_state(self, language_code) -> None:
         if not language_code:
@@ -458,15 +416,6 @@ class SettingsWindow:
         if model_name not in self._model_choices():
             model_name = self._default_model_for_backend()
         self._set_model(model_name)
-        self._update_backend_visibility()
-
-    def _update_backend_visibility(self) -> None:
-        using_openai = self._current_backend() == "openai"
-        self.api_key_entry.set_sensitive(using_openai)
-        if using_openai:
-            self.api_key_entry.show()
-        else:
-            self.api_key_entry.hide()
 
     def _update_language_visibility(self) -> None:
         mode = self.language_mode_combo.get_active_id() or "auto"
@@ -598,11 +547,7 @@ class SettingsWindow:
         return custom_code
 
     def _collect_config(self) -> dict:
-        backend = self._current_backend()
-        api_key = self.api_key_entry.get_text().strip()
-        if backend == "openai" and not api_key:
-            raise ValueError("OpenAI API key is required.")
-        if backend == "local" and WhisperModel is None:
+        if WhisperModel is None:
             raise ValueError("Local transcription requires the faster-whisper package.")
 
         hotkey = (self.captured_hotkey or "").strip()
@@ -619,8 +564,7 @@ class SettingsWindow:
         merged = dict(self.app.config)
         merged.update(
             {
-                "transcription_backend": backend,
-                "openai_api_key": api_key,
+                "transcription_backend": "local",
                 "transcription_model": self._current_model(),
                 "language": self._collect_language(),
                 "max_recording_seconds": max_recording_seconds,
@@ -708,7 +652,7 @@ class AppIndicatorUI:
         description_label = Gtk.Label(
             label=(
                 "Mint Dictate lets you dictate into text fields on Linux Mint and transcribes "
-                "your speech through OpenAI speech-to-text using your own API key."
+                "your speech with a local faster-whisper model."
             )
         )
         description_label.set_xalign(0)
@@ -822,7 +766,6 @@ class AppIndicatorUI:
         copy_item.connect("activate", self._activate, self.app.copy_last_transcript)
         menu.append(copy_item)
 
-        menu.append(self._build_model_backend_item("openai", "API model"))
         menu.append(self._build_model_backend_item("local", "Local model"))
 
         language_item = Gtk.MenuItem(label=f"Language: {language_label(self.app.config.get('language'))}")
@@ -925,22 +868,6 @@ class PystrayUI:
                 "Copy Last Transcript Again",
                 lambda icon, item: self.app.copy_last_transcript(),
                 enabled=lambda item: bool(self.app.last_transcript),
-            ),
-            pystray.MenuItem(
-                "API model",
-                pystray.Menu(
-                    *[
-                        pystray.MenuItem(
-                            model_label(model_name),
-                            lambda icon, item, model=model_name: self.app.set_transcription_choice("openai", model),
-                            checked=lambda item, model=model_name: (
-                                self.app.config.get("transcription_backend", DEFAULT_CONFIG["transcription_backend"]) == "openai"
-                                and self.app.config.get("transcription_model", DEFAULT_CONFIG["transcription_model"]) == model
-                            ),
-                        )
-                        for model_name in OPENAI_TRANSCRIPTION_MODELS
-                    ]
-                ),
             ),
             pystray.MenuItem(
                 "Local model",
@@ -1048,7 +975,7 @@ class MintDictateApp:
     def restart_service(self) -> None:
         logging.info("Restart requested from tray menu")
         subprocess.Popen(
-            ["systemctl", "--user", "restart", "mint-dictate.service"],
+            ["systemctl", "--user", "restart", "mint-dictate-local.service"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -1064,14 +991,7 @@ class MintDictateApp:
         self._start_hotkey_listener()
 
     def _refresh_clients(self) -> None:
-        backend = self.config.get("transcription_backend", DEFAULT_CONFIG["transcription_backend"])
-        if backend == "openai":
-            api_key = self.config["openai_api_key"] or os.environ.get("OPENAI_API_KEY", "")
-            if not api_key:
-                raise RuntimeError("OpenAI API key ontbreekt in config.json of OPENAI_API_KEY.")
-            self.client = OpenAI(api_key=api_key)
-        else:
-            self.client = None
+        self.client = None
         self.local_model = None
 
     def apply_config(self, new_config: dict) -> None:
@@ -1089,24 +1009,19 @@ class MintDictateApp:
         notify(APP_NAME, success_message)
 
     def set_transcription_choice(self, backend: str, model_name: str) -> None:
-        if model_name not in models_for_backend(backend):
-            notify(APP_NAME, f"Ongeldig model voor backend {backend}: {model_name}")
+        if model_name not in LOCAL_TRANSCRIPTION_MODELS:
+            notify(APP_NAME, f"Ongeldig lokaal model: {model_name}")
             return
-        if backend == "openai":
-            api_key = self.config.get("openai_api_key") or os.environ.get("OPENAI_API_KEY", "")
-            if not api_key:
-                notify(APP_NAME, "OpenAI API key ontbreekt. Stel die eerst in via Settings of config.json.")
-                return
-        if backend == "local" and WhisperModel is None:
+        if WhisperModel is None:
             notify(APP_NAME, "Lokale transcriptie vereist het pakket faster-whisper.")
             return
         try:
             self._persist_and_apply_config(
                 {
-                    "transcription_backend": backend,
+                    "transcription_backend": "local",
                     "transcription_model": model_name,
                 },
-                f"Transcriptie ingesteld op {backend_label(backend)} / {model_label(model_name)}.",
+                f"Transcriptie ingesteld op lokaal / {model_label(model_name)}.",
             )
         except Exception as exc:
             logging.exception("Failed to switch transcription choice")
@@ -1458,21 +1373,7 @@ class MintDictateApp:
         return str(path)
 
     def _transcribe(self, audio_path: str) -> str:
-        if self.config.get("transcription_backend", DEFAULT_CONFIG["transcription_backend"]) == "local":
-            return self._transcribe_local(audio_path)
-        return self._transcribe_openai(audio_path)
-
-    def _transcribe_openai(self, audio_path: str) -> str:
-        request = {
-            "model": self.config["transcription_model"],
-            "language": self.config.get("language") or None,
-        }
-        with open(audio_path, "rb") as fh:
-            transcript = self.client.audio.transcriptions.create(
-                file=fh,
-                **{key: value for key, value in request.items() if value is not None},
-            )
-        return transcript.text
+        return self._transcribe_local(audio_path)
 
     def _get_local_model(self):
         if WhisperModel is None:

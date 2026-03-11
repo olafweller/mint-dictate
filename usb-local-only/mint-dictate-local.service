@@ -1,0 +1,18 @@
+[Unit]
+Description=Mint Dictate Local Tray
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=__INSTALL_DIR__
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=%h/.Xauthority
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/bin/sleep 8
+ExecStart=/usr/bin/python3 __INSTALL_DIR__/mint_dictate.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
