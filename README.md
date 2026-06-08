@@ -34,11 +34,12 @@ https://ko-fi.com/mintdictate
 - OpenAI mode uses your own OpenAI API key.
 - Local mode downloads the Parakeet model on first use.
 
-## Install From GitHub Release
+## Install
 
-Download the latest `.deb` from the GitHub releases page, then install it with:
+Download and install the latest `.deb`:
 
 ```bash
+wget https://github.com/olafweller/mint-dictate/raw/main/mint-dictate.deb
 sudo apt install ./mint-dictate.deb
 mint-dictate-setup
 ```
