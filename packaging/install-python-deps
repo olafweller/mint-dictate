@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="/opt/mint-dictate"
+VENV_DIR="${APP_DIR}/.venv"
+
+python3 -m venv "${VENV_DIR}"
+"${VENV_DIR}/bin/pip" install --upgrade pip
+"${VENV_DIR}/bin/pip" install -r "${APP_DIR}/requirements.txt"

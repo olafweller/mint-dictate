@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="/opt/mint-dictate"
+CONFIG_DIR="${HOME}/.config/mint-dictate"
+CONFIG_FILE="${CONFIG_DIR}/config.json"
+SERVICE_NAME="mint-dictate.service"
+
+if [[ ! -d "${APP_DIR}/.venv" ]]; then
+  echo "Preparing Mint Dictate Python environment..."
+  sudo /usr/lib/mint-dictate/install-python-deps
+fi
+
+mkdir -p "${CONFIG_DIR}"
+if [[ ! -f "${CONFIG_FILE}" ]]; then
+  cp "${APP_DIR}/config.example.json" "${CONFIG_FILE}"
+fi
+
+systemctl --user daemon-reload
+systemctl --user enable --now "${SERVICE_NAME}"
+
+echo "Mint Dictate is installed and running."
+echo "Config: ${CONFIG_FILE}"
+echo "Settings and donation link are available from the tray menu."

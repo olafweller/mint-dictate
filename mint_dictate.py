@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
 import gc
 import json
 import logging
@@ -7,6 +9,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -18,8 +21,13 @@ from pathlib import Path
 APP_NAME = "Mint Dictate"
 APP_ID = "mint-dictate"
 APP_AUTHOR = "Olaf Weller"
-APP_WEBSITE = "https://x.com/WellerOlaf"
-APP_DESCRIPTION = "Dictate text anywhere in Linux Mint with OpenAI or a local Whisper model."
+APP_WEBSITE = "https://github.com/olafweller/mint-dictate"
+APP_DONATION_URL = "https://ko-fi.com/mintdictate"
+APP_DESCRIPTION = "Dictate text anywhere in Linux Mint with OpenAI or local Parakeet speech-to-text."
+APP_SUPPORT_TEXT = (
+    "Mint Dictate is free and open source. If it saves you time and makes Linux Mint more fun "
+    "now that you can talk to your computer, consider supporting the project on Ko-fi."
+)
 APP_DIR = Path(__file__).resolve().parent
 for site_packages in sorted((APP_DIR / ".venv" / "lib").glob("python*/site-packages")):
     site_path = str(site_packages)
@@ -30,7 +38,7 @@ import numpy as np
 import pyperclip
 import sounddevice as sd
 import soundfile as sf
-from openai import OpenAI
+from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 from PIL import Image, ImageDraw
 from pynput import keyboard
 
@@ -57,19 +65,39 @@ except Exception:
     pystray = None
 
 try:
-    from faster_whisper import WhisperModel
+    import onnx_asr
 except Exception:
-    WhisperModel = None
+    onnx_asr = None
 
 PROJECT_CONFIG_PATH = Path.cwd() / "config.json"
 USER_CONFIG_PATH = Path.home() / ".config" / "mint-dictate" / "config.json"
 LEGACY_USER_CONFIG_PATH = Path.home() / ".config" / "linux-mint-speech-to-text" / "config.json"
 LOG_PATH = Path.home() / ".cache" / "mint-dictate.log"
 ICON_CACHE_DIR = Path.home() / ".cache" / "mint-dictate-icons"
+
+
+def env_with_local_cuda_libraries() -> dict[str, str]:
+    env = os.environ.copy()
+    cuda_library_dirs: list[str] = []
+    for site_packages in sorted((APP_DIR / ".venv" / "lib").glob("python*/site-packages")):
+        nvidia_dir = site_packages / "nvidia"
+        for package_dir in ("cublas", "cudnn", "cuda_runtime"):
+            library_dir = nvidia_dir / package_dir / "lib"
+            if library_dir.is_dir():
+                cuda_library_dirs.append(str(library_dir))
+
+    if cuda_library_dirs:
+        current_library_path = env.get("LD_LIBRARY_PATH", "")
+        existing_dirs = [path for path in current_library_path.split(":") if path]
+        env["LD_LIBRARY_PATH"] = ":".join([*cuda_library_dirs, *existing_dirs])
+
+    return env
+
+
 DEFAULT_CONFIG = {
-    "transcription_backend": "openai",
+    "transcription_backend": "local",
     "openai_api_key": "",
-    "transcription_model": "gpt-4o-mini-transcribe",
+    "transcription_model": "nemo-parakeet-tdt-0.6b-v3",
     "language": None,
     "sample_rate": 16000,
     "channels": 1,
@@ -78,11 +106,18 @@ DEFAULT_CONFIG = {
     "paste_delay_seconds": 0.15,
     "recording_path": str(Path(tempfile.gettempdir()) / "mint-dictate.wav"),
     "pause_media_during_recording": True,
+    "stop_media_players": ["de.haeckerfelix.Shortwave"],
     "local_model_device": "cpu",
     "local_model_compute_type": "int8",
+    "openai_request_timeout_seconds": 20,
+    "openai_retry_window_seconds": 600,
+    "openai_retry_poll_seconds": 3,
+    "local_model_idle_timeout_seconds": 120,
     "local_transcription_stats": {},
+    "replacement_rules": "",
 }
-LOCAL_MODEL_IDLE_TIMEOUT_SECONDS = 120
+OPENAI_CONNECTIVITY_HOST = "api.openai.com"
+OPENAI_CONNECTIVITY_PORT = 443
 OPENAI_TRANSCRIPTION_MODELS = [
     "gpt-4o-mini-transcribe",
     "gpt-4o-transcribe",
@@ -90,22 +125,18 @@ OPENAI_TRANSCRIPTION_MODELS = [
     "whisper-1",
 ]
 LOCAL_TRANSCRIPTION_MODELS = [
-    "large-v3-turbo",
-    "medium",
-    "small",
+    "nemo-parakeet-tdt-0.6b-v3",
 ]
 MODEL_LABELS = {
     "gpt-4o-mini-transcribe": "GPT-4o mini",
     "gpt-4o-transcribe": "GPT-4o Transcribe",
     "gpt-4o-transcribe-diarize": "GPT-4o Transcribe diarize",
     "whisper-1": "Whisper",
-    "large-v3-turbo": "Large v3 Turbo",
-    "medium": "Medium",
-    "small": "Small",
+    "nemo-parakeet-tdt-0.6b-v3": "Parakeet v3 (CPU)",
 }
 TRANSCRIPTION_BACKENDS = [
     ("openai", "OpenAI API"),
-    ("local", "Local faster-whisper"),
+    ("local", "Local model"),
 ]
 LANGUAGE_OPTIONS = [
     ("ar", "Arabic"),
@@ -132,8 +163,13 @@ STATE_COLORS = {
     "idle": "#7a7a7a",
     "recording": "#d73737",
     "transcribing": "#2d7dd2",
+    "waiting_network": "#f08c00",
     "error": "#d9a404",
 }
+
+
+class ApiNetworkUnavailableError(RuntimeError):
+    pass
 
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 ICON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -205,28 +241,34 @@ def launch_path(path: Path) -> None:
         notify(APP_NAME, f"Kon {path} niet openen: xdg-open ontbreekt.")
 
 
+def launch_url(url: str) -> None:
+    try:
+        subprocess.Popen(
+            ["xdg-open", url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        notify(APP_NAME, f"Kon {url} niet openen: xdg-open ontbreekt.")
+
+
 def run_local_transcription_worker_server(
     model_name: str,
     device: str,
     compute_type: str,
 ) -> int:
-    if WhisperModel is None:
-        print(json.dumps({"error": "faster-whisper is niet geïnstalleerd."}), flush=True)
+    dependency_error = local_model_dependency_error(model_name)
+    if dependency_error:
+        print(json.dumps({"error": dependency_error}), flush=True)
         return 1
 
     try:
-        model = WhisperModel(model_name, device=device, compute_type=compute_type)
+        model = onnx_asr.load_model(model_name, providers=["CPUExecutionProvider"])
         print(json.dumps({"ready": True}), flush=True)
         for line in sys.stdin:
             request = json.loads(line)
             audio_path = str(request["audio_path"])
-            language = request.get("language") or None
-            segments, _info = model.transcribe(
-                audio_path,
-                beam_size=5,
-                language=language,
-            )
-            text = " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
+            text = str(model.recognize(audio_path)).strip()
             print(json.dumps({"text": text}), flush=True)
         return 0
     except Exception as exc:
@@ -272,6 +314,18 @@ def model_label(model_name: str) -> str:
     return MODEL_LABELS.get(model_name, model_name)
 
 
+def is_local_parakeet_model(model_name: str) -> bool:
+    return model_name == "nemo-parakeet-tdt-0.6b-v3"
+
+
+def local_model_dependency_error(model_name: str) -> str | None:
+    if is_local_parakeet_model(model_name):
+        if onnx_asr is None:
+            return "Local Parakeet transcription requires the onnx-asr package."
+        return None
+    return f"Unsupported local model: {model_name}"
+
+
 def language_label(language_code: str | None) -> str:
     if not language_code:
         return "Auto Detect"
@@ -279,6 +333,51 @@ def language_label(language_code: str | None) -> str:
         if code == language_code:
             return label
     return language_code
+
+
+def apply_transcription_corrections(text: str) -> str:
+    return text
+
+
+def replacement_rules_text(config: dict) -> str:
+    return str(config.get("replacement_rules", DEFAULT_CONFIG["replacement_rules"]) or "").strip()
+
+
+def parse_replacement_rules(raw_rules: str) -> list[tuple[str, str]]:
+    rules: list[tuple[str, str]] = []
+    for line in raw_rules.splitlines():
+        entry = line.strip()
+        if not entry or entry.startswith("#"):
+            continue
+        if "=>" not in entry:
+            raise ValueError("Elke vervangregel moet 'bron => doel' gebruiken.")
+        source, target = entry.split("=>", 1)
+        source = source.strip()
+        target = target.strip()
+        if not source or not target:
+            raise ValueError("Elke vervangregel moet zowel bron als doel bevatten.")
+        rules.append((source, target))
+    return rules
+
+
+def format_replacement_rules(rules: list[tuple[str, str]]) -> str:
+    return "\n".join(f"{source} => {target}" for source, target in rules)
+
+
+def apply_configured_replacements(text: str, config: dict) -> str:
+    corrected = apply_transcription_corrections(text)
+    for source, target in parse_replacement_rules(replacement_rules_text(config)):
+        corrected = re.sub(rf"\b{re.escape(source)}\b", target, corrected, flags=re.IGNORECASE)
+    return corrected
+
+
+def configured_stop_media_players(config: dict) -> set[str]:
+    players = config.get("stop_media_players", DEFAULT_CONFIG["stop_media_players"])
+    if isinstance(players, str):
+        players = re.split(r"[\n,]", players)
+    if not isinstance(players, list):
+        return set()
+    return {str(player).strip() for player in players if str(player).strip()}
 
 
 def load_config() -> dict:
@@ -297,8 +396,16 @@ def load_config() -> dict:
             loaded["transcription_model"] = loaded["whisper_model"]
         if loaded.get("transcription_model") in LOCAL_TRANSCRIPTION_MODELS and "transcription_backend" not in loaded:
             loaded["transcription_backend"] = "local"
+        loaded.pop("venice_api_key", None)
+        loaded.pop("venice_base_url", None)
         config.update(loaded)
         logging.info("Loaded config from %s", path)
+    valid_backends = {backend for backend, _label in TRANSCRIPTION_BACKENDS}
+    if config.get("transcription_backend") not in valid_backends:
+        config["transcription_backend"] = DEFAULT_CONFIG["transcription_backend"]
+    valid_models = models_for_backend(config["transcription_backend"])
+    if config.get("transcription_model") not in valid_models:
+        config["transcription_model"] = valid_models[0]
     return config
 
 
@@ -306,6 +413,8 @@ def save_user_config(config: dict) -> None:
     USER_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = dict(config)
     payload.pop("whisper_model", None)
+    payload.pop("venice_api_key", None)
+    payload.pop("venice_base_url", None)
     USER_CONFIG_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     logging.info("Saved config to %s", USER_CONFIG_PATH)
 
@@ -329,6 +438,7 @@ class SettingsWindow:
         self.captured_hotkey = app.config.get("hotkey", DEFAULT_CONFIG["hotkey"])
         self.capture_dialog = None
         self.capture_label = None
+        self.replacement_rule_rows = []
 
         self.window = Gtk.Window(title=f"{APP_NAME} Settings")
         self.window.set_default_size(560, 360)
@@ -371,6 +481,20 @@ class SettingsWindow:
         language_box.pack_start(self.custom_language_entry, False, False, 0)
         self.language_box = language_box
 
+        self.replacement_rules_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        replacement_scroller = Gtk.ScrolledWindow()
+        replacement_scroller.set_min_content_height(140)
+        replacement_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        replacement_scroller.add(self.replacement_rules_list)
+
+        self.add_replacement_button = Gtk.Button(label="+ Add Replacement")
+        self.add_replacement_button.connect("clicked", self._on_add_replacement_rule)
+
+        replacement_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        replacement_box.pack_start(replacement_scroller, True, True, 0)
+        replacement_box.pack_start(self.add_replacement_button, False, False, 0)
+        self.replacement_rules_box = replacement_box
+
         self.hotkey_value_label = Gtk.Label()
         self.hotkey_value_label.set_xalign(0)
         self.capture_button = Gtk.Button(label="Capture Hotkey...")
@@ -380,17 +504,22 @@ class SettingsWindow:
         hotkey_box.pack_end(self.capture_button, False, False, 0)
         self.hotkey_box = hotkey_box
 
-        self.max_recording_entry = Gtk.SpinButton()
-        self.max_recording_entry.set_range(1, 3600)
-        self.max_recording_entry.set_increments(1, 10)
+        self.max_recording_minutes_entry, self.max_recording_seconds_entry, self.max_recording_box = (
+            self._build_duration_input()
+        )
+        self.local_idle_minutes_entry, self.local_idle_seconds_entry, self.local_idle_timeout_box = (
+            self._build_duration_input()
+        )
 
         rows = [
             ("Transcription Backend", self.backend_combo),
-            ("OpenAI API Key", self.api_key_entry),
+            ("API Key", self.api_key_entry),
             ("Transcription Model", self.model_combo),
             ("Language", self.language_box),
+            ("Word Replacements", self.replacement_rules_box),
             ("Hotkey", self.hotkey_box),
-            ("Max Recording (sec)", self.max_recording_entry),
+            ("Max Recording", self.max_recording_box),
+            ("Local Model Idle", self.local_idle_timeout_box),
         ]
         for index, (label_text, widget) in enumerate(rows):
             label = Gtk.Label(label=label_text)
@@ -399,7 +528,7 @@ class SettingsWindow:
             widget.set_hexpand(True)
             grid.attach(widget, 1, index, 1, 1)
 
-        helper_label = Gtk.Label(label="Advanced options remain available in the config file.")
+        helper_label = Gtk.Label(label="Set local idle to 0 min 0 sec to keep the model loaded until app exit.")
         helper_label.set_xalign(0)
         outer.pack_start(helper_label, False, False, 0)
 
@@ -420,6 +549,42 @@ class SettingsWindow:
 
         self.load_from_app_config()
 
+    def _build_duration_input(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+
+        minutes_entry = Gtk.SpinButton()
+        minutes_entry.set_range(0, 1440)
+        minutes_entry.set_increments(1, 5)
+
+        seconds_entry = Gtk.SpinButton()
+        seconds_entry.set_range(0, 59)
+        seconds_entry.set_increments(1, 10)
+
+        box.pack_start(minutes_entry, False, False, 0)
+        box.pack_start(Gtk.Label(label="min"), False, False, 0)
+        box.pack_start(seconds_entry, False, False, 0)
+        box.pack_start(Gtk.Label(label="sec"), False, False, 0)
+
+        return minutes_entry, seconds_entry, box
+
+    def _set_duration_input(self, minutes_entry, seconds_entry, total_seconds: int | float) -> None:
+        total_seconds = max(0, int(total_seconds or 0))
+        minutes, seconds = divmod(total_seconds, 60)
+        minutes_entry.set_value(float(minutes))
+        seconds_entry.set_value(float(seconds))
+
+    def _collect_duration_input(self, minutes_entry, seconds_entry, field_name: str, minimum_seconds: int) -> int:
+        try:
+            minutes = int(minutes_entry.get_value())
+            seconds = int(seconds_entry.get_value())
+        except Exception as exc:
+            raise ValueError(f"{field_name} must use whole minutes and seconds.") from exc
+
+        total_seconds = (minutes * 60) + seconds
+        if total_seconds < minimum_seconds:
+            raise ValueError(f"{field_name} must be at least {minimum_seconds} second.")
+        return total_seconds
+
     def show(self) -> None:
         self.load_from_app_config()
         self.message_label.set_text("")
@@ -431,13 +596,102 @@ class SettingsWindow:
     def load_from_app_config(self) -> None:
         config = self.app.config
         self.backend_combo.set_active_id(config.get("transcription_backend", DEFAULT_CONFIG["transcription_backend"]))
-        self.api_key_entry.set_text(config.get("openai_api_key", ""))
+        self.api_key_entry.set_text(self._api_key_for_backend(self._current_backend()))
         self._set_model(config.get("transcription_model", DEFAULT_CONFIG["transcription_model"]))
         self._set_language_state(config.get("language"))
+        self._load_replacement_rules(replacement_rules_text(config))
         self.captured_hotkey = config.get("hotkey", DEFAULT_CONFIG["hotkey"])
         self.hotkey_value_label.set_text(self.captured_hotkey)
-        self.max_recording_entry.set_value(float(config.get("max_recording_seconds", DEFAULT_CONFIG["max_recording_seconds"])))
+        self._set_duration_input(
+            self.max_recording_minutes_entry,
+            self.max_recording_seconds_entry,
+            config.get("max_recording_seconds", DEFAULT_CONFIG["max_recording_seconds"]),
+        )
+        self._set_duration_input(
+            self.local_idle_minutes_entry,
+            self.local_idle_seconds_entry,
+            config.get(
+                "local_model_idle_timeout_seconds",
+                DEFAULT_CONFIG["local_model_idle_timeout_seconds"],
+            ),
+        )
         self._update_backend_visibility()
+
+    def _clear_replacement_rule_rows(self) -> None:
+        for row in self.replacement_rule_rows:
+            self.replacement_rules_list.remove(row["container"])
+        self.replacement_rule_rows = []
+
+    def _add_replacement_rule_row(self, source: str = "", target: str = "") -> None:
+        row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+
+        source_entry = Gtk.Entry()
+        source_entry.set_placeholder_text("Replace this")
+        source_entry.set_text(source)
+        source_entry.set_hexpand(True)
+
+        arrow_label = Gtk.Label(label="->")
+        arrow_label.set_xalign(0.5)
+
+        target_entry = Gtk.Entry()
+        target_entry.set_placeholder_text("With this")
+        target_entry.set_text(target)
+        target_entry.set_hexpand(True)
+
+        remove_button = Gtk.Button(label="Remove")
+
+        row = {
+            "container": row_box,
+            "source": source_entry,
+            "target": target_entry,
+            "remove": remove_button,
+        }
+        remove_button.connect("clicked", self._on_remove_replacement_rule, row)
+
+        row_box.pack_start(source_entry, True, True, 0)
+        row_box.pack_start(arrow_label, False, False, 0)
+        row_box.pack_start(target_entry, True, True, 0)
+        row_box.pack_start(remove_button, False, False, 0)
+
+        self.replacement_rule_rows.append(row)
+        self.replacement_rules_list.pack_start(row_box, False, False, 0)
+        row_box.show_all()
+
+    def _load_replacement_rules(self, raw_rules: str) -> None:
+        self._clear_replacement_rule_rows()
+        parsed_rules = parse_replacement_rules(raw_rules) if raw_rules else []
+        if not parsed_rules:
+            self._add_replacement_rule_row()
+            return
+        for source, target in parsed_rules:
+            self._add_replacement_rule_row(source, target)
+
+    def _collect_replacement_rules(self) -> str:
+        lines = []
+        for row in self.replacement_rule_rows:
+            source = row["source"].get_text().strip()
+            target = row["target"].get_text().strip()
+            if not source and not target:
+                continue
+            if not source or not target:
+                raise ValueError("Elke woordvervanging moet zowel een bron als vervanging hebben.")
+            lines.append(f"{source} => {target}")
+        replacement_rules = "\n".join(lines)
+        parse_replacement_rules(replacement_rules)
+        return replacement_rules
+
+    def _on_add_replacement_rule(self, _button) -> None:
+        self._add_replacement_rule_row()
+        self.replacement_rules_list.show_all()
+
+    def _on_remove_replacement_rule(self, _button, row: dict) -> None:
+        if row not in self.replacement_rule_rows:
+            return
+        self.replacement_rule_rows.remove(row)
+        self.replacement_rules_list.remove(row["container"])
+        if not self.replacement_rule_rows:
+            self._add_replacement_rule_row()
+        self.replacement_rules_list.show_all()
 
     def _set_model(self, model_name: str) -> None:
         items = self._model_choices()
@@ -456,15 +710,16 @@ class SettingsWindow:
     def _current_backend(self) -> str:
         return self.backend_combo.get_active_id() or DEFAULT_CONFIG["transcription_backend"]
 
+    def _api_key_for_backend(self, backend: str) -> str:
+        if backend == "openai":
+            return self.app.config.get("openai_api_key", "")
+        return ""
+
     def _model_choices(self) -> list[str]:
-        if self._current_backend() == "local":
-            return list(LOCAL_TRANSCRIPTION_MODELS)
-        return list(OPENAI_TRANSCRIPTION_MODELS)
+        return models_for_backend(self._current_backend())
 
     def _default_model_for_backend(self) -> str:
-        if self._current_backend() == "local":
-            return LOCAL_TRANSCRIPTION_MODELS[0]
-        return OPENAI_TRANSCRIPTION_MODELS[0]
+        return models_for_backend(self._current_backend())[0]
 
     def _set_language_state(self, language_code) -> None:
         if not language_code:
@@ -490,12 +745,13 @@ class SettingsWindow:
         if model_name not in self._model_choices():
             model_name = self._default_model_for_backend()
         self._set_model(model_name)
+        self.api_key_entry.set_text(self._api_key_for_backend(self._current_backend()))
         self._update_backend_visibility()
 
     def _update_backend_visibility(self) -> None:
-        using_openai = self._current_backend() == "openai"
-        self.api_key_entry.set_sensitive(using_openai)
-        if using_openai:
+        using_api_backend = self._current_backend() == "openai"
+        self.api_key_entry.set_sensitive(using_api_backend)
+        if using_api_backend:
             self.api_key_entry.show()
         else:
             self.api_key_entry.hide()
@@ -634,31 +890,43 @@ class SettingsWindow:
         api_key = self.api_key_entry.get_text().strip()
         if backend == "openai" and not api_key:
             raise ValueError("OpenAI API key is required.")
-        if backend == "local" and WhisperModel is None:
-            raise ValueError("Local transcription requires the faster-whisper package.")
+        if backend == "local":
+            dependency_error = local_model_dependency_error(self._current_model())
+            if dependency_error:
+                raise ValueError(dependency_error)
 
         hotkey = (self.captured_hotkey or "").strip()
         if not hotkey:
             raise ValueError("Capture a hotkey before saving.")
 
-        try:
-            max_recording_seconds = int(self.max_recording_entry.get_value())
-        except Exception as exc:
-            raise ValueError("Max recording must be a whole number.") from exc
-        if max_recording_seconds < 1:
-            raise ValueError("Max recording must be at least 1 second.")
+        max_recording_seconds = self._collect_duration_input(
+            self.max_recording_minutes_entry,
+            self.max_recording_seconds_entry,
+            "Max recording",
+            1,
+        )
+        local_idle_timeout_seconds = self._collect_duration_input(
+            self.local_idle_minutes_entry,
+            self.local_idle_seconds_entry,
+            "Local model idle timeout",
+            0,
+        )
+
+        replacement_rules = self._collect_replacement_rules()
 
         merged = dict(self.app.config)
-        merged.update(
-            {
-                "transcription_backend": backend,
-                "openai_api_key": api_key,
-                "transcription_model": self._current_model(),
-                "language": self._collect_language(),
-                "max_recording_seconds": max_recording_seconds,
-                "hotkey": hotkey,
-            }
-        )
+        updates = {
+            "transcription_backend": backend,
+            "transcription_model": self._current_model(),
+            "language": self._collect_language(),
+            "replacement_rules": replacement_rules,
+            "max_recording_seconds": max_recording_seconds,
+            "local_model_idle_timeout_seconds": local_idle_timeout_seconds,
+            "hotkey": hotkey,
+        }
+        if backend == "openai":
+            updates["openai_api_key"] = api_key
+        merged.update(updates)
         return merged
 
     def _on_save(self, _button) -> None:
@@ -680,6 +948,101 @@ class SettingsWindow:
         return True
 
 
+class QuickAddReplacementWindow:
+    def __init__(self, app: "MintDictateApp", parent: Gtk.Window | None = None) -> None:
+        self.app = app
+        self.parent = parent
+
+        self.window = Gtk.Window(title="Add Word Replacement")
+        self.window.set_default_size(420, 160)
+        self.window.set_border_width(16)
+        self.window.set_modal(True)
+        if parent is not None:
+            self.window.set_transient_for(parent)
+        self.window.connect("delete-event", self._on_delete)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.window.add(outer)
+
+        description = Gtk.Label(
+            label="Add a word or phrase to replace in transcripts.",
+        )
+        description.set_xalign(0)
+        outer.pack_start(description, False, False, 0)
+
+        grid = Gtk.Grid(column_spacing=12, row_spacing=10)
+        outer.pack_start(grid, True, True, 0)
+
+        source_label = Gtk.Label(label="Replace")
+        source_label.set_xalign(0)
+        grid.attach(source_label, 0, 0, 1, 1)
+
+        self.source_entry = Gtk.Entry()
+        self.source_entry.set_placeholder_text("Example: linux mint")
+        self.source_entry.set_hexpand(True)
+        self.source_entry.connect("activate", self._on_save)
+        grid.attach(self.source_entry, 1, 0, 1, 1)
+
+        target_label = Gtk.Label(label="With")
+        target_label.set_xalign(0)
+        grid.attach(target_label, 0, 1, 1, 1)
+
+        self.target_entry = Gtk.Entry()
+        self.target_entry.set_placeholder_text("Example: Linux Mint")
+        self.target_entry.set_hexpand(True)
+        self.target_entry.connect("activate", self._on_save)
+        grid.attach(self.target_entry, 1, 1, 1, 1)
+
+        self.message_label = Gtk.Label()
+        self.message_label.set_xalign(0)
+        outer.pack_start(self.message_label, False, False, 0)
+
+        button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        outer.pack_end(button_box, False, False, 0)
+
+        cancel_button = Gtk.Button(label="Cancel")
+        cancel_button.connect("clicked", self._on_cancel)
+        button_box.pack_end(cancel_button, False, False, 0)
+
+        save_button = Gtk.Button(label="Save")
+        save_button.connect("clicked", self._on_save)
+        button_box.pack_end(save_button, False, False, 0)
+
+    def show(self) -> None:
+        self.source_entry.set_text("")
+        self.target_entry.set_text("")
+        self.message_label.set_text("")
+        self.window.show_all()
+        self.window.present()
+        self.source_entry.grab_focus()
+
+    def _set_error(self, message: str) -> None:
+        self.message_label.set_markup(f'<span foreground="#b00020">{GLib.markup_escape_text(message)}</span>')
+
+    def _on_save(self, _widget) -> None:
+        source = self.source_entry.get_text().strip()
+        target = self.target_entry.get_text().strip()
+        if not source or not target:
+            self._set_error("Vul zowel het bronwoord als de vervanging in.")
+            return
+        try:
+            action = self.app.add_word_replacement(source, target)
+        except Exception as exc:
+            logging.exception("Failed to save word replacement")
+            self._set_error(str(exc))
+            return
+
+        notify(APP_NAME, f"Word replacement {action}: {source} -> {target}")
+        self.window.hide()
+
+    def _on_cancel(self, _button) -> None:
+        self.window.hide()
+
+    def _on_delete(self, *_args):
+        self.window.hide()
+        return True
+
+
 class AppIndicatorUI:
     def __init__(self, app: "MintDictateApp") -> None:
         self.app = app
@@ -692,6 +1055,7 @@ class AppIndicatorUI:
         self.indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
         self.indicator.set_title(APP_NAME)
         self.settings_window = SettingsWindow(app)
+        self.quick_add_replacement_window = QuickAddReplacementWindow(app, self.settings_window.window)
         self.about_window = self._build_about_window()
         self.menu = None
         self.refresh()
@@ -716,12 +1080,19 @@ class AppIndicatorUI:
         self.settings_window.show()
         return False
 
+    def show_quick_add_replacement(self) -> None:
+        GLib.idle_add(self._show_quick_add_replacement_on_main)
+
+    def _show_quick_add_replacement_on_main(self) -> bool:
+        self.quick_add_replacement_window.show()
+        return False
+
     def show_about(self) -> None:
         GLib.idle_add(self._show_about_on_main)
 
     def _build_about_window(self) -> Gtk.Window:
         window = Gtk.Window(title=f"About {APP_NAME}")
-        window.set_default_size(480, 260)
+        window.set_default_size(520, 340)
         window.set_border_width(16)
         window.connect("delete-event", self._hide_about_window)
 
@@ -740,18 +1111,27 @@ class AppIndicatorUI:
         description_label = Gtk.Label(
             label=(
                 "Mint Dictate lets you dictate into text fields on Linux Mint and transcribes "
-                "your speech through OpenAI speech-to-text using your own API key."
+                "your speech through OpenAI or local Parakeet speech-to-text."
             )
         )
         description_label.set_xalign(0)
         description_label.set_line_wrap(True)
         outer.pack_start(description_label, False, False, 0)
 
+        support_label = Gtk.Label(label=APP_SUPPORT_TEXT)
+        support_label.set_xalign(0)
+        support_label.set_line_wrap(True)
+        outer.pack_start(support_label, False, False, 0)
+
         author_label = Gtk.Label(label=f"Made by {APP_AUTHOR}")
         author_label.set_xalign(0)
         outer.pack_start(author_label, False, False, 0)
 
-        link_button = Gtk.LinkButton.new_with_label(APP_WEBSITE, "Creator on X")
+        donation_button = Gtk.LinkButton.new_with_label(APP_DONATION_URL, "Support Mint Dictate on Ko-fi")
+        donation_button.set_halign(Gtk.Align.START)
+        outer.pack_start(donation_button, False, False, 0)
+
+        link_button = Gtk.LinkButton.new_with_label(APP_WEBSITE, "Project on GitHub")
         link_button.set_halign(Gtk.Align.START)
         outer.pack_start(link_button, False, False, 0)
 
@@ -834,6 +1214,11 @@ class AppIndicatorUI:
         toggle_item.connect("activate", self._activate, self.app.toggle_recording)
         menu.append(toggle_item)
 
+        if self.app.is_recording:
+            cancel_item = Gtk.MenuItem(label="Cancel Recording")
+            cancel_item.connect("activate", self._activate, self.app.cancel_recording)
+            menu.append(cancel_item)
+
         status_item = Gtk.MenuItem(label=f"Status: {self.app.status_label()}")
         status_item.set_sensitive(False)
         menu.append(status_item)
@@ -842,6 +1227,23 @@ class AppIndicatorUI:
             progress_item = Gtk.MenuItem(label=f"Local progress: {self.app.local_progress_percent()}%")
             progress_item.set_sensitive(False)
             menu.append(progress_item)
+
+        local_worker_item = Gtk.MenuItem(label=self.app.local_worker_status_label())
+        local_worker_item.set_sensitive(False)
+        menu.append(local_worker_item)
+
+        load_local_item = Gtk.MenuItem(label="Load Local Model")
+        load_local_item.set_sensitive(
+            self.app.config.get("transcription_backend", DEFAULT_CONFIG["transcription_backend"]) == "local"
+            and not self.app.is_local_worker_loaded()
+        )
+        load_local_item.connect("activate", self._activate, self.app.load_local_model_now)
+        menu.append(load_local_item)
+
+        unload_local_item = Gtk.MenuItem(label="Unload Local Model")
+        unload_local_item.set_sensitive(self.app.is_local_worker_loaded())
+        unload_local_item.connect("activate", self._activate, self.app.unload_local_model_now)
+        menu.append(unload_local_item)
 
         transcript = self.app.last_transcript.strip()
         preview = transcript[:40] + ("..." if len(transcript) > 40 else "")
@@ -854,16 +1256,24 @@ class AppIndicatorUI:
         copy_item.connect("activate", self._activate, self.app.copy_last_transcript)
         menu.append(copy_item)
 
-        menu.append(self._build_model_backend_item("openai", "API model"))
+        menu.append(self._build_model_backend_item("openai", "OpenAI model"))
         menu.append(self._build_model_backend_item("local", "Local model"))
 
         language_item = Gtk.MenuItem(label=f"Language: {language_label(self.app.config.get('language'))}")
         language_item.set_submenu(self._build_language_submenu())
         menu.append(language_item)
 
+        add_replacement_item = Gtk.MenuItem(label="Add Word Replacement")
+        add_replacement_item.connect("activate", self._activate, self.show_quick_add_replacement)
+        menu.append(add_replacement_item)
+
         settings_item = Gtk.MenuItem(label="Settings")
         settings_item.connect("activate", self._activate, self.show_settings)
         menu.append(settings_item)
+
+        donate_item = Gtk.MenuItem(label="Donate")
+        donate_item.connect("activate", self._activate, self.app.open_donation_url)
+        menu.append(donate_item)
 
         about_item = Gtk.MenuItem(label="About")
         about_item.connect("activate", self._activate, self.show_about)
@@ -924,6 +1334,9 @@ class PystrayUI:
     def show_settings(self) -> None:
         self.app.open_config()
 
+    def show_quick_add_replacement(self) -> None:
+        self.app.show_add_word_replacement()
+
     def _build_menu(self):
         if not self.menu_supported:
             return None
@@ -932,6 +1345,11 @@ class PystrayUI:
             pystray.MenuItem(
                 lambda item: "Stop Recording" if self.app.is_recording else "Start Recording",
                 lambda icon, item: self.app.toggle_recording(),
+            ),
+            pystray.MenuItem(
+                "Cancel Recording",
+                lambda icon, item: self.app.cancel_recording(),
+                visible=lambda item: self.app.is_recording,
             ),
             pystray.MenuItem(
                 lambda item: f"Status: {self.app.status_label()}",
@@ -943,6 +1361,24 @@ class PystrayUI:
                 lambda icon, item: None,
                 enabled=False,
                 visible=lambda item: self.app.should_show_local_progress(),
+            ),
+            pystray.MenuItem(
+                lambda item: self.app.local_worker_status_label(),
+                lambda icon, item: None,
+                enabled=False,
+            ),
+            pystray.MenuItem(
+                "Load Local Model",
+                lambda icon, item: self.app.load_local_model_now(),
+                enabled=lambda item: (
+                    self.app.config.get("transcription_backend", DEFAULT_CONFIG["transcription_backend"]) == "local"
+                    and not self.app.is_local_worker_loaded()
+                ),
+            ),
+            pystray.MenuItem(
+                "Unload Local Model",
+                lambda icon, item: self.app.unload_local_model_now(),
+                enabled=lambda item: self.app.is_local_worker_loaded(),
             ),
             pystray.MenuItem(
                 lambda item: (
@@ -959,7 +1395,7 @@ class PystrayUI:
                 enabled=lambda item: bool(self.app.last_transcript),
             ),
             pystray.MenuItem(
-                "API model",
+                "OpenAI model",
                 pystray.Menu(
                     *[
                         pystray.MenuItem(
@@ -1024,7 +1460,9 @@ class PystrayUI:
                     ),
                 ),
             ),
+            pystray.MenuItem("Add Word Replacement", lambda icon, item: self.show_quick_add_replacement()),
             pystray.MenuItem("Settings", lambda icon, item: self.show_settings()),
+            pystray.MenuItem("Donate", lambda icon, item: self.app.open_donation_url()),
             pystray.MenuItem("About", lambda icon, item: self.app.show_about()),
             pystray.MenuItem("Restart Mint Dictate", lambda icon, item: self.app.restart_service()),
         )
@@ -1105,7 +1543,13 @@ class MintDictateApp:
             api_key = self.config["openai_api_key"] or os.environ.get("OPENAI_API_KEY", "")
             if not api_key:
                 raise RuntimeError("OpenAI API key ontbreekt in config.json of OPENAI_API_KEY.")
-            self.client = OpenAI(api_key=api_key)
+            timeout_seconds = float(
+                self.config.get(
+                    "openai_request_timeout_seconds",
+                    DEFAULT_CONFIG["openai_request_timeout_seconds"],
+                )
+            )
+            self.client = OpenAI(api_key=api_key, timeout=timeout_seconds, max_retries=0)
         else:
             self.client = None
         self._cancel_local_worker_unload_timer()
@@ -1134,9 +1578,11 @@ class MintDictateApp:
             if not api_key:
                 notify(APP_NAME, "OpenAI API key ontbreekt. Stel die eerst in via Settings of config.json.")
                 return
-        if backend == "local" and WhisperModel is None:
-            notify(APP_NAME, "Lokale transcriptie vereist het pakket faster-whisper.")
-            return
+        if backend == "local":
+            dependency_error = local_model_dependency_error(model_name)
+            if dependency_error:
+                notify(APP_NAME, dependency_error)
+                return
         try:
             self._persist_and_apply_config(
                 {
@@ -1159,6 +1605,37 @@ class MintDictateApp:
             logging.exception("Failed to switch language")
             notify(APP_NAME, f"Wisselen van taal mislukt: {exc}")
 
+    def add_word_replacement(self, source: str, target: str) -> str:
+        source = source.strip()
+        target = target.strip()
+        if not source or not target:
+            raise ValueError("Elke vervangregel moet zowel bron als doel bevatten.")
+
+        rules = parse_replacement_rules(replacement_rules_text(self.config))
+        action = "added"
+        updated_rules: list[tuple[str, str]] = []
+        replaced_existing = False
+        for existing_source, existing_target in rules:
+            if existing_source == source:
+                updated_rules.append((source, target))
+                replaced_existing = True
+                if existing_target != target:
+                    action = "updated"
+            else:
+                updated_rules.append((existing_source, existing_target))
+        if not replaced_existing:
+            updated_rules.append((source, target))
+
+        self._persist_and_apply_config(
+            {"replacement_rules": format_replacement_rules(updated_rules)},
+            f"Word replacement {action}: {source} -> {target}",
+        )
+
+        settings_window = getattr(self.ui, "settings_window", None)
+        if settings_window is not None:
+            settings_window.load_from_app_config()
+        return action
+
     def open_config(self) -> None:
         config_path = USER_CONFIG_PATH if USER_CONFIG_PATH.exists() else PROJECT_CONFIG_PATH
         launch_path(config_path)
@@ -1166,8 +1643,17 @@ class MintDictateApp:
     def open_log(self) -> None:
         launch_path(LOG_PATH)
 
+    def open_donation_url(self) -> None:
+        launch_url(APP_DONATION_URL)
+
     def show_settings(self) -> None:
         self.ui.show_settings()
+
+    def show_add_word_replacement(self) -> None:
+        if hasattr(self.ui, "show_quick_add_replacement"):
+            self.ui.show_quick_add_replacement()
+            return
+        notify(APP_NAME, "Quick add word replacement is not available on this tray backend.")
 
     def copy_last_transcript(self) -> None:
         if not self.last_transcript:
@@ -1257,6 +1743,72 @@ class MintDictateApp:
             self.local_worker_unload_timer.cancel()
             self.local_worker_unload_timer = None
 
+    def is_local_worker_loaded(self) -> bool:
+        with self.local_worker_lock:
+            process = self.local_worker_process
+            return process is not None and process.poll() is None
+
+    def local_worker_status_label(self) -> str:
+        if not self.is_local_worker_loaded():
+            return "Local model: not loaded"
+        profile = self.local_worker_profile
+        model_name = profile[0] if profile else self.config.get("transcription_model", "")
+        return f"Local model: loaded ({model_label(model_name)})"
+
+    def load_local_model_now(self) -> None:
+        if self.config.get("transcription_backend", DEFAULT_CONFIG["transcription_backend"]) != "local":
+            notify(APP_NAME, "Kies eerst een lokaal model.")
+            return
+        if self.busy:
+            notify(APP_NAME, "Mint Dictate is bezig. Probeer het zo opnieuw.")
+            return
+        try:
+            self._ensure_local_worker()
+            self._schedule_local_worker_unload()
+            self.ui.refresh()
+            notify(APP_NAME, f"Lokaal model geladen: {model_label(self.config['transcription_model'])}.")
+        except Exception as exc:
+            logging.exception("Failed to load local model")
+            self.last_error = str(exc)
+            self._set_state("error")
+            notify(APP_NAME, f"Lokaal model laden mislukt: {exc}")
+
+    def unload_local_model_now(self) -> None:
+        self._cancel_local_worker_unload_timer()
+        self._stop_local_worker()
+        self.ui.refresh()
+        notify(APP_NAME, "Lokaal model uit geheugen gehaald.")
+
+    def _preload_local_worker_for_recording(self) -> None:
+        if self.config.get("transcription_backend", DEFAULT_CONFIG["transcription_backend"]) != "local":
+            return
+        if self.is_local_worker_loaded():
+            return
+        try:
+            self._ensure_local_worker()
+            self.ui.refresh()
+            logging.info("Preloaded local transcription worker during recording")
+        except Exception as exc:
+            logging.exception("Failed to preload local transcription worker during recording")
+            self.last_error = str(exc)
+
+    def _start_local_worker_preload_thread(self) -> None:
+        if self.config.get("transcription_backend", DEFAULT_CONFIG["transcription_backend"]) != "local":
+            return
+        worker = threading.Thread(target=self._preload_local_worker_for_recording, daemon=True)
+        worker.start()
+
+    def _local_worker_idle_timeout_seconds(self) -> float:
+        try:
+            return float(
+                self.config.get(
+                    "local_model_idle_timeout_seconds",
+                    DEFAULT_CONFIG["local_model_idle_timeout_seconds"],
+                )
+            )
+        except (TypeError, ValueError):
+            return float(DEFAULT_CONFIG["local_model_idle_timeout_seconds"])
+
     def _stop_local_worker(self) -> None:
         with self.local_worker_lock:
             process = self.local_worker_process
@@ -1279,7 +1831,7 @@ class MintDictateApp:
             except Exception:
                 pass
         gc.collect()
-        logging.info("Stopped local Whisper worker")
+        logging.info("Stopped local transcription worker")
 
     def _schedule_local_worker_unload(self) -> None:
         if self.config.get("transcription_backend", DEFAULT_CONFIG["transcription_backend"]) != "local":
@@ -1287,21 +1839,26 @@ class MintDictateApp:
         with self.local_worker_lock:
             if self.local_worker_process is None or self.local_worker_process.poll() is not None:
                 return
+        idle_timeout_seconds = self._local_worker_idle_timeout_seconds()
+        if idle_timeout_seconds <= 0:
+            logging.info("Keeping local transcription worker loaded until app exit")
+            return
         self._cancel_local_worker_unload_timer()
         self.local_worker_unload_timer = threading.Timer(
-            LOCAL_MODEL_IDLE_TIMEOUT_SECONDS,
+            idle_timeout_seconds,
             self._stop_local_worker_from_timer,
         )
         self.local_worker_unload_timer.daemon = True
         self.local_worker_unload_timer.start()
         logging.info(
-            "Scheduled local Whisper worker stop in %s seconds",
-            LOCAL_MODEL_IDLE_TIMEOUT_SECONDS,
+            "Scheduled local transcription worker stop in %s seconds",
+            idle_timeout_seconds,
         )
 
     def _stop_local_worker_from_timer(self) -> None:
         self.local_worker_unload_timer = None
         self._stop_local_worker()
+        self.ui.refresh()
 
     def _ensure_local_worker(self):
         profile = self._local_worker_config()
@@ -1345,6 +1902,7 @@ class MintDictateApp:
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
+                env=env_with_local_cuda_libraries() if profile[1] == "cuda" else None,
             )
             ready_line = process.stdout.readline() if process.stdout else ""
             try:
@@ -1361,7 +1919,7 @@ class MintDictateApp:
 
             self.local_worker_process = process
             self.local_worker_profile = profile
-            logging.info("Started local Whisper worker for %s/%s/%s", *profile)
+            logging.info("Started local transcription worker for %s/%s/%s", *profile)
             return process
 
     def _schedule_local_progress_tick(self) -> None:
@@ -1389,6 +1947,8 @@ class MintDictateApp:
         language_value = self.config.get("language") or "auto"
         message = (
             f"{APP_DESCRIPTION}\n"
+            f"{APP_SUPPORT_TEXT}\n"
+            f"Donate: {APP_DONATION_URL}\n"
             f"Made by {APP_AUTHOR}.\n"
             f"Hotkey: {self.config['hotkey']}\n"
             f"Backend: {self.config.get('transcription_backend', DEFAULT_CONFIG['transcription_backend'])}\n"
@@ -1441,9 +2001,11 @@ class MintDictateApp:
             self.paused_players = []
             return
 
+        stop_players = configured_stop_media_players(self.config)
         for player in self.paused_players:
+            command = "stop" if player in stop_players else "pause"
             subprocess.run(
-                [playerctl_path, "-p", player, "pause"],
+                [playerctl_path, "-p", player, command],
                 check=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -1479,6 +2041,34 @@ class MintDictateApp:
 
             self._start_recording_internal()
 
+    def cancel_recording(self) -> None:
+        with self.state_lock:
+            if not self.is_recording:
+                return
+
+            self._cancel_timer()
+            if self.stream:
+                try:
+                    self.stream.stop()
+                    self.stream.close()
+                except Exception:
+                    pass
+                self.stream = None
+
+            with self.audio_lock:
+                self.audio_chunks = []
+
+            self.is_recording = False
+            self.busy = False
+            self.recording_started_at = 0.0
+            self.transcription_started_at = 0.0
+            self.local_progress_audio_duration = 0.0
+            self._set_local_progress(None)
+            self._resume_paused_media()
+            self._set_state("idle")
+            self.last_error = ""
+            notify(APP_NAME, "Opname geannuleerd.")
+
     def _start_recording_internal(self) -> None:
         with self.audio_lock:
             self.audio_chunks = []
@@ -1508,6 +2098,7 @@ class MintDictateApp:
         self.last_error = ""
         self._set_state("recording")
         self._pause_media_for_recording()
+        self._start_local_worker_preload_thread()
         self._schedule_auto_stop()
         notify(APP_NAME, "Recording started.")
 
@@ -1619,20 +2210,122 @@ class MintDictateApp:
 
     def _transcribe(self, audio_path: str) -> str:
         if self.config.get("transcription_backend", DEFAULT_CONFIG["transcription_backend"]) == "local":
-            return self._transcribe_local(audio_path)
-        return self._transcribe_openai(audio_path)
+            text = self._transcribe_local(audio_path)
+        else:
+            text = self._transcribe_api(audio_path)
+        return apply_configured_replacements(text, self.config)
 
-    def _transcribe_openai(self, audio_path: str) -> str:
+    def _api_connectivity_target(self) -> tuple[str, int]:
+        return OPENAI_CONNECTIVITY_HOST, OPENAI_CONNECTIVITY_PORT
+
+    def _has_api_connectivity(self) -> bool:
+        host, port = self._api_connectivity_target()
+        try:
+            with socket.create_connection(
+                (host, port),
+                timeout=2.0,
+            ):
+                return True
+        except OSError:
+            return False
+
+    def _wait_for_api_connectivity(self, deadline: float) -> None:
+        backend = self.config.get("transcription_backend", DEFAULT_CONFIG["transcription_backend"])
+        if backend != "openai":
+            return
+
+        poll_seconds = max(
+            1.0,
+            float(
+                self.config.get(
+                    "openai_retry_poll_seconds",
+                    DEFAULT_CONFIG["openai_retry_poll_seconds"],
+                )
+            ),
+        )
+        waiting_notified = False
+
+        while time.time() < deadline:
+            if self._has_api_connectivity():
+                if waiting_notified:
+                    self._set_state("transcribing")
+                    self.last_error = ""
+                    notify(APP_NAME, "Internetverbinding hersteld. Transcriptie wordt hervat.")
+                return
+
+            self.last_error = "Geen internetverbinding. Wachten op herstel om transcriptie te hervatten."
+            self._set_state("waiting_network")
+            if not waiting_notified:
+                notify(
+                    APP_NAME,
+                    "Internetverbinding verbroken. Ik blijf wachten en probeer opnieuw zodra de verbinding terug is.",
+                )
+                waiting_notified = True
+            time.sleep(poll_seconds)
+
+        raise ApiNetworkUnavailableError(
+            "Geen internetverbinding. Transcriptie hervat niet binnen de ingestelde wachttijd."
+        )
+
+    def _transcribe_api(self, audio_path: str) -> str:
+        retry_window_seconds = max(
+            5.0,
+            float(
+                self.config.get(
+                    "openai_retry_window_seconds",
+                    DEFAULT_CONFIG["openai_retry_window_seconds"],
+                )
+            ),
+        )
+        deadline = time.time() + retry_window_seconds
         request = {
             "model": self.config["transcription_model"],
             "language": self.config.get("language") or None,
         }
-        with open(audio_path, "rb") as fh:
-            transcript = self.client.audio.transcriptions.create(
-                file=fh,
-                **{key: value for key, value in request.items() if value is not None},
-            )
-        return transcript.text
+        cleaned_request = {key: value for key, value in request.items() if value is not None}
+
+        while True:
+            self._wait_for_api_connectivity(deadline)
+            self._set_state("transcribing")
+            try:
+                with open(audio_path, "rb") as fh:
+                    transcript = self.client.audio.transcriptions.create(
+                        file=fh,
+                        timeout=float(
+                            self.config.get(
+                                "openai_request_timeout_seconds",
+                                DEFAULT_CONFIG["openai_request_timeout_seconds"],
+                            )
+                        ),
+                        **cleaned_request,
+                    )
+                self.last_error = ""
+                return transcript.text
+            except (APIConnectionError, APITimeoutError) as exc:
+                logging.warning("API transcription retry due to connectivity issue: %s", exc)
+                self.last_error = f"Netwerkfout tijdens transcriptie: {exc}"
+                if time.time() >= deadline:
+                    raise ApiNetworkUnavailableError(
+                        "Internetverbinding niet op tijd hersteld. Probeer opnieuw zodra je weer online bent."
+                    ) from exc
+            except APIStatusError as exc:
+                if exc.status_code and int(exc.status_code) >= 500 and time.time() < deadline:
+                    logging.warning("Retrying API transcription after server error %s", exc.status_code)
+                    self.last_error = f"API tijdelijk niet bereikbaar ({exc.status_code}). Nieuwe poging volgt."
+                    self._set_state("waiting_network")
+                    time.sleep(
+                        max(
+                            1.0,
+                            float(
+                                self.config.get(
+                                    "openai_retry_poll_seconds",
+                                    DEFAULT_CONFIG["openai_retry_poll_seconds"],
+                                )
+                            ),
+                        )
+                    )
+                    continue
+                raise
 
     def _transcribe_local(self, audio_path: str) -> str:
         audio_info = sf.info(audio_path)
@@ -1678,6 +2371,7 @@ class MintDictateApp:
             "idle": "Idle",
             "recording": "Recording",
             "transcribing": "Transcribing",
+            "waiting_network": "Offline - waiting to retry",
             "error": "Error",
         }
         return labels.get(self.state, self.state.title())
