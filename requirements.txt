@@ -1,4 +1,5 @@
 openai>=1.30.0
+onnx-asr[cpu,hub]>=0.11.0
 numpy>=1.26.0
 sounddevice>=0.4.6
 soundfile>=0.12.1

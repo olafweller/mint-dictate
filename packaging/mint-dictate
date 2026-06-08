@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="/opt/mint-dictate"
+
+if [[ ! -d "${APP_DIR}/.venv" ]]; then
+  echo "Mint Dictate dependencies are not installed yet." >&2
+  echo "Run: mint-dictate-setup" >&2
+  exit 1
+fi
+
+exec /usr/bin/python3 "${APP_DIR}/mint_dictate.py" "$@"

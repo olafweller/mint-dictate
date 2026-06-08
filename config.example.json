@@ -1,11 +1,21 @@
 {
-  "openai_api_key": "sk-your-key-here",
-  "transcription_model": "gpt-4o-mini-transcribe",
+  "transcription_backend": "local",
+  "transcription_model": "nemo-parakeet-tdt-0.6b-v3",
+  "openai_api_key": "",
   "language": null,
   "sample_rate": 16000,
   "channels": 1,
   "max_recording_seconds": 300,
   "hotkey": "<ctrl>+<alt>+m",
+  "replacement_rules": "",
   "paste_delay_seconds": 0.15,
-  "recording_path": "/tmp/mint-dictate.wav"
+  "recording_path": "/tmp/mint-dictate.wav",
+  "pause_media_during_recording": true,
+  "stop_media_players": ["de.haeckerfelix.Shortwave"],
+  "openai_request_timeout_seconds": 20,
+  "openai_retry_window_seconds": 600,
+  "openai_retry_poll_seconds": 3,
+  "local_model_idle_timeout_seconds": 120,
+  "local_model_device": "cpu",
+  "local_model_compute_type": "int8"
 }

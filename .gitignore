@@ -11,3 +11,8 @@ config.json
 # Temporary audio
 *.wav
 *.flac
+
+# Build outputs
+build/
+dist/
+*.deb

@@ -5,12 +5,10 @@ Wants=graphical-session.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/projects/mint-dictate
-Environment=DISPLAY=:0
-Environment=XAUTHORITY=%h/.Xauthority
+WorkingDirectory=/opt/mint-dictate
 Environment=PYTHONUNBUFFERED=1
 ExecStartPre=/bin/sleep 8
-ExecStart=/usr/bin/python3 %h/projects/mint-dictate/mint_dictate.py
+ExecStart=/usr/bin/mint-dictate
 Restart=on-failure
 RestartSec=3
 

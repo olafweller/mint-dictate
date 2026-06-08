@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Mint Dictate
+Comment=Desktop dictation for Linux Mint
+Exec=mint-dictate
+Terminal=false
+Categories=Utility;Audio;
+StartupNotify=false

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+/usr/lib/mint-dictate/install-python-deps
+
+echo "Mint Dictate installed."
+echo "Run 'mint-dictate-setup' as your normal desktop user to create config and start the tray service."
