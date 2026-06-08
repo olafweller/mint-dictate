@@ -1,38 +1,12 @@
 # Mint Dictate
 
-Mint Dictate is a Linux Mint X11 tray app that turns a configurable global hotkey into desktop dictation. It records your voice, transcribes it with OpenAI speech-to-text or a local Parakeet model, copies the transcript to the clipboard, and automatically pastes it into the active text field.
+Mint Dictate lets you dictate text anywhere on Linux Mint. Press a hotkey, speak, and the transcript is pasted into the text field you were using.
 
-It is built for practical dictation on Cinnamon/X11. Browser address bars, VS Code, chat apps, and standard text editors are the main target.
+It is made for Linux Mint Cinnamon on X11 and works well in browser text fields, chat apps, VS Code, notes, email, and other everyday writing places.
 
 Mint Dictate is free and open source. If it saves you time and makes Linux Mint more fun now that you can talk to your computer, consider supporting the project on Ko-fi:
 
 https://ko-fi.com/mintdictate
-
-## What's Included
-
-- OpenAI speech-to-text with your own OpenAI API key
-- Local speech-to-text with `nemo-parakeet-tdt-0.6b-v3`
-- Configurable global hotkey to start and stop recording
-- Linux Mint tray menu with status, settings, model selection, last transcript, word replacements, about, and donate
-- GTK settings window for backend, OpenAI API key, model, language, hotkey, max recording time, and word replacements
-- Clipboard-first workflow, then automatic `Ctrl+V` paste
-- Optional media auto-pause during recording when `playerctl` is installed
-- `systemd --user` service for auto-start on login
-
-## Not Included
-
-- Venice API
-- Whisper local models such as `large-v3-turbo`, `medium`, or `small`
-- Telemetry
-- Paid support, roadmap promises, or a guaranteed release schedule
-
-## Limitations
-
-- X11 only. Wayland is not a supported target.
-- Paste is simulated with `xdotool`, so the target text field must still have focus when transcription finishes.
-- Media auto-pause only works for players that expose MPRIS controls.
-- OpenAI mode uses your own OpenAI API key.
-- Local mode downloads the Parakeet model on first use.
 
 ## Install
 
@@ -44,11 +18,21 @@ sudo apt install ./mint-dictate.deb
 mint-dictate-setup
 ```
 
-The setup command creates your user config, enables the user service, and starts Mint Dictate.
+After setup, Mint Dictate starts as a tray app. Use the tray menu to open `Settings`, switch between local and OpenAI transcription, change the hotkey, and add word replacements.
 
-## Configure OpenAI
+## How It Works
 
-Mint Dictate starts with local Parakeet by default. To use OpenAI:
+- Press the configured hotkey to start recording.
+- Press it again to stop.
+- Mint Dictate transcribes the recording.
+- The transcript is copied to your clipboard.
+- `Ctrl+V` is sent to paste the text into the active field.
+
+By default, Mint Dictate uses local Parakeet speech-to-text. The local model downloads on first use.
+
+## OpenAI Option
+
+You can also use OpenAI speech-to-text with your own OpenAI API key:
 
 1. Open the tray menu.
 2. Choose `Settings`.
@@ -56,33 +40,29 @@ Mint Dictate starts with local Parakeet by default. To use OpenAI:
 4. Paste your OpenAI API key into `API Key`.
 5. Save.
 
-Your config is stored in:
+Your settings are stored locally in:
 
 ```text
 ~/.config/mint-dictate/config.json
 ```
 
+## Privacy
+
+- Local mode transcribes on your computer after the Parakeet model has been downloaded.
+- OpenAI mode sends the recorded audio to OpenAI for transcription using your own API key.
+- Your API key is stored in your local config file.
+- Mint Dictate does not include telemetry or usage tracking.
+
 ## Requirements
 
-The `.deb` package installs the system packages it needs through APT dependencies. For source installs, install:
+- Linux Mint Cinnamon on X11
+- A working microphone
+- Internet access for installation and first local model download
+- For OpenAI mode: your own OpenAI API key
 
-```bash
-sudo apt install python3 python3-venv python3-dev build-essential python3-gi gir1.2-ayatanaappindicator3-0.1 xdotool libnotify-bin xclip playerctl libevdev-dev
-```
+Wayland is not supported. Paste is simulated with `xdotool`, so the target text field must still have focus when transcription finishes.
 
-## Source Install
-
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-mkdir -p ~/.config/mint-dictate
-cp config.example.json ~/.config/mint-dictate/config.json
-python3 mint_dictate.py
-```
-
-The app uses system `python3` so GTK/AppIndicator is available, and loads the project `.venv` packages automatically.
-
-## Useful Commands
+## Troubleshooting
 
 Service status:
 
@@ -100,6 +80,19 @@ Config:
 
 ```bash
 xdg-open ~/.config/mint-dictate/config.json
+```
+
+## Source Install
+
+Most users should use the `.deb` above. For source installs:
+
+```bash
+sudo apt install python3 python3-venv python3-dev build-essential python3-gi gir1.2-ayatanaappindicator3-0.1 xdotool libnotify-bin xclip playerctl libevdev-dev
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+mkdir -p ~/.config/mint-dictate
+cp config.example.json ~/.config/mint-dictate/config.json
+python3 mint_dictate.py
 ```
 
 ## License
