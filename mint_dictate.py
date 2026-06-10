@@ -1913,9 +1913,20 @@ class MintDictateApp:
                 stderr_output = ""
                 if process.stderr:
                     stderr_output = process.stderr.read().strip()
+                worker_error = str(ready_payload.get("error", "")).strip()
+                if worker_error:
+                    logging.error("Local transcription worker startup failed: %s", worker_error)
+                elif stderr_output:
+                    logging.error("Local transcription worker startup stderr: %s", stderr_output)
+                elif ready_line:
+                    logging.error("Local transcription worker returned unexpected startup output: %s", ready_line.strip())
                 self.local_worker_process = None
                 self.local_worker_profile = None
-                raise RuntimeError(stderr_output or "Lokale transcriptieworker startte niet correct.")
+                raise RuntimeError(
+                    worker_error
+                    or stderr_output
+                    or "Lokale transcriptieworker startte niet correct. Bekijk ~/.cache/mint-dictate.log voor details."
+                )
 
             self.local_worker_process = process
             self.local_worker_profile = profile

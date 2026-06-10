@@ -76,6 +76,18 @@ Logs:
 journalctl --user -u mint-dictate.service -n 50 --no-pager
 ```
 
+App log:
+
+```bash
+tail -n 80 ~/.cache/mint-dictate.log
+```
+
+Test the local Parakeet model startup:
+
+```bash
+/opt/mint-dictate/.venv/bin/python /opt/mint-dictate/mint_dictate.py --local-transcribe-server nemo-parakeet-tdt-0.6b-v3 cpu int8
+```
+
 Config:
 
 ```bash
