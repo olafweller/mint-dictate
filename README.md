@@ -13,7 +13,7 @@ https://ko-fi.com/mintdictate
 Download and install the latest `.deb`:
 
 ```bash
-wget https://github.com/olafweller/mint-dictate/raw/main/mint-dictate.deb
+wget -O mint-dictate.deb https://github.com/olafweller/mint-dictate/raw/main/mint-dictate.deb
 sudo apt install ./mint-dictate.deb
 mint-dictate-setup
 ```
@@ -80,6 +80,13 @@ App log:
 
 ```bash
 tail -n 80 ~/.cache/mint-dictate.log
+```
+
+Repair an incomplete local Parakeet model download:
+
+```bash
+mint-dictate-repair-local-model
+systemctl --user start mint-dictate.service
 ```
 
 Test the local Parakeet model startup:

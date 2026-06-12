@@ -273,7 +273,7 @@ def run_local_transcription_worker_server(
         return 0
     except Exception as exc:
         logging.exception("Local transcription worker failed")
-        print(json.dumps({"error": str(exc)}), flush=True)
+        print(json.dumps({"error": friendly_local_worker_error(str(exc))}), flush=True)
         return 1
 
 
@@ -324,6 +324,15 @@ def local_model_dependency_error(model_name: str) -> str | None:
             return "Local Parakeet transcription requires the onnx-asr package."
         return None
     return f"Unsupported local model: {model_name}"
+
+
+def friendly_local_worker_error(message: str) -> str:
+    if "External data path does not exist" in message and "encoder-model.onnx.data" in message:
+        return (
+            "De lokale Parakeet modeldownload lijkt incompleet. "
+            "Herstel dit met: mint-dictate-repair-local-model"
+        )
+    return message
 
 
 def language_label(language_code: str | None) -> str:
@@ -1104,7 +1113,7 @@ class AppIndicatorUI:
         title_label.set_xalign(0)
         outer.pack_start(title_label, False, False, 0)
 
-        version_label = Gtk.Label(label="Version 0.1.0")
+        version_label = Gtk.Label(label="Version 0.1.1")
         version_label.set_xalign(0)
         outer.pack_start(version_label, False, False, 0)
 
@@ -1922,11 +1931,12 @@ class MintDictateApp:
                     logging.error("Local transcription worker returned unexpected startup output: %s", ready_line.strip())
                 self.local_worker_process = None
                 self.local_worker_profile = None
-                raise RuntimeError(
+                error_message = (
                     worker_error
                     or stderr_output
                     or "Lokale transcriptieworker startte niet correct. Bekijk ~/.cache/mint-dictate.log voor details."
                 )
+                raise RuntimeError(friendly_local_worker_error(error_message))
 
             self.local_worker_process = process
             self.local_worker_profile = profile

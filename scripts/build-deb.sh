@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="${1:-0.1.0}"
+VERSION="${1:-0.1.1}"
 ARCHITECTURE="${2:-amd64}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${ROOT_DIR}/build"
@@ -24,6 +24,7 @@ install -m 0644 "${ROOT_DIR}/LICENSE" "${PKG_DIR}/opt/mint-dictate/LICENSE"
 
 install -m 0755 "${ROOT_DIR}/packaging/mint-dictate" "${PKG_DIR}/usr/bin/mint-dictate"
 install -m 0755 "${ROOT_DIR}/packaging/mint-dictate-setup" "${PKG_DIR}/usr/bin/mint-dictate-setup"
+install -m 0755 "${ROOT_DIR}/packaging/mint-dictate-repair-local-model" "${PKG_DIR}/usr/bin/mint-dictate-repair-local-model"
 install -m 0755 "${ROOT_DIR}/packaging/install-python-deps" "${PKG_DIR}/usr/lib/mint-dictate/install-python-deps"
 install -m 0644 "${ROOT_DIR}/packaging/mint-dictate.service" "${PKG_DIR}/usr/lib/systemd/user/mint-dictate.service"
 install -m 0644 "${ROOT_DIR}/packaging/mint-dictate.desktop" "${PKG_DIR}/usr/share/applications/mint-dictate.desktop"

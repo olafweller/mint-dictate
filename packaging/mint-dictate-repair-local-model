@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODEL_CACHE="${HOME}/.cache/huggingface/hub/models--istupakov--parakeet-tdt-0.6b-v3-onnx"
+SERVICE_NAME="mint-dictate.service"
+
+systemctl --user stop "${SERVICE_NAME}" 2>/dev/null || true
+
+if [[ -d "${MODEL_CACHE}" ]]; then
+  rm -rf "${MODEL_CACHE}"
+  echo "Removed local Parakeet model cache:"
+  echo "${MODEL_CACHE}"
+else
+  echo "Local Parakeet model cache was not present:"
+  echo "${MODEL_CACHE}"
+fi
+
+echo
+echo "Start Mint Dictate again with:"
+echo "systemctl --user start ${SERVICE_NAME}"
+echo
+echo "The local model will download again on first use."
